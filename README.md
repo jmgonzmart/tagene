@@ -1,21 +1,89 @@
 # README
 
-This software allows the user to import gene annotation from a gtf or gff3 file into a MySQL database with the Ensembl/Otter schema.
-It is part of the gene annotation workflow followed by the Ensembl Havana team.
+TAGENE imports custom gene annotation, normally derived from long RNA-seq data, into an existing reference annotation. The input annotation must be in GTF or GFF3 format. The reference annotation must be stored in a MySQL database that has the Ensembl/Otter schema, which is an extension of the [Ensembl core schema](https://mart.ensembl.org/info/docs/api/core/core_schema.html).
+
+TAGENE is part of the gene annotation workflow followed by the Ensembl Havana team at EMBL-EBI. Currently, it is not suitable for external use.
 
 The TAGENE pipeline:
 
-* reads gene annotation from an input file in gtf or gff3 format, normally derived from long RNA-seq read data;
-* filters the input annotation to remove transcripts containing potentially spurious splice sites;
-* compares the input annotation with the reference annotation from a database with the Ensembl/Otter schema;
+* extracts transcript annotation from the input file, as well as supporting reads from BAM files if available;
+* filters the input annotation to remove transcripts containing potentially spurious splice junctions;
+* compares the filtered input annotation with the reference annotation to find novelty, assigns each transcript to a gene, works out the best transcript biotype and adds a CDS if appropriate;
 * stores in the database the input annotation that provides some novelty, either by adding novel transcripts or by extending existing transcripts using novel exonic sequence.
 
 
+## Pipeline steps
+
+### 1. Input annotation quality check
+
+The input annotation file can be pre-filtered at the start of the pipeline to remove transcripts with dubious novel splice junctions. 
+This step consists of a set of filters, deliberately conservative, that were determined empirically by the manual gene annotation experts at EMBL-EBI:
+
+#### a) RNA-seq support of the novel intron
+This filter uses [Recount3](https://rna.recount.bio/) as a proxy for RNA-seq support. Transcripts containing novel introns having a Recount3 score (total number of reads supporting a splice junction) below a certain threshold are filtered out. The default score is 50.
+
+#### b) Splice site sequence alignment
+It searches the sequence alignments near the splice sites for any mismatches and indels, and creates a 'misalignment score' that is proportional to the distance to the splice site. It requires access to a BAM file that contains the reads from which the transcript was assembled.
+
+#### c) Splice site overlap with sequence repeats
+It looks for the overlap of both splice sites of an intron with the same repeat feature. These repeat features can be extracted from the Ensembl core databases.
+
+#### d) Overlap with processed pseudogenes
+It filters out an input transcript that overlaps on either strand a genomic window spanning the boundaries of an annotated processed pseudogene expanded with the median 5' and 3' UTR lengths in the reference annotation. The rationale behind this filter is that reads corresponding to the parent protein-coding gene could align to a processed pseudogene instead, due to the alignment of the read poly(A) tail to the genomic poly(A) sequence inserted at retrotransposition, resulting in a higher mapping score for the pseudogene location.
+
+#### e) Overlap with protein-coding genes on the opposite strand
+It looks for transcripts originating from reads that map onto the opposite strand of a protein-coding gene. Sometimes these reads should align to the protein-coding gene, but the aligner was unable to find canonical splice sites on the correct strand due to poor sequence quality of the read. The filter will not be applied if the input transcript can genuinely be assigned to an existing gene which is antisense to the coding gene. Otherwise, the transcript will be filtered out if it is entirely located within the window corresponding to the coding gene boundaries plus an extra buffer of 400 nt on either side and it overlaps one of the gene's terminal exons.
+
+#### f) Non-canonical splice junctions
+Transcripts containing non-canonical splice junctions can be filtered out. Canonical splice junctions to be allowed can be specified as a pipeline option (default is just GT-AG).
+
+#### g) Short terminal exons
+This filter checks for start and end exon sizes that are smaller than a given threshold (default is 15 nt). In many cases, these short terminal exons are created by spurious canonical splice junctions made up by the aligner because of poor read sequence quality.
+
+#### h) MANE_exon_overlap
+It discards transcripts containing introns that map entirely within an exon of a MANE Select transcript.
+
+The output of this step is a list of input transcripts that contain at least an intron that failed any of the filters. Transcripts in the list will be ignored in subsequent steps.
+
+This step is optional and can be skipped if:
+-the filter list from a previous pipeline run using the same input annotation file is provided;
+-the filters are applied during the annotation step;
+-no intron filters are required.
+
+### 2. Reset the target database
+
+This step is optional and should only be carried out when running pipeline tests. It synchronises the target database, i.e. the database containing the reference annotation where the input annotation will be imported, with another reference database (source database) before the annotation step. It effectively makes the target database a copy of the source database.
+
+### 3. Split the input annotation file
+
+The input annotation file is normally split in smaller input files to be processed independently. Each smaller input file contains one or more genomic clusters of transcripts (a cluster may contain transcripts on both strands but no transcriptless gap). The original input file doesn't have to be sorted by genomic location: the pipeline will sort and group the input transcripts in clusters.
+
+### 4. Annotation
+
+The annotation in each individual input file is parsed and stored in memory. The pipeline then searches the reference annotation database for possible host genes for each input transcript and determines which gene is the most suitable one. If there is no host gene for a transcript, it will create a new gene. At the same time, several filters are applied: input transcripts can be rejected based on the biotype or protected status of the chosen host gene, or on the number of genes with exonic overlap with the transcript.
+
+Input transcripts are subsequently compared with each existing transcript in the host gene and the pipeline determines if the input transcript provides any exon or intron novelty and whether both transcripts could be merged. Based on all these comparisons, the pipeline decides whether to merge the input transcript with an existing transcript or to add the input transcript as a novel transcript.
+
+Then, the pipeline attempts to create a CDS if the host gene is protein-coding, and chooses an adequate biotype for the transcript.
+
+Eventually, the pipeline will try to store the new annotation (one gene at a time) in the target database. As this process uses the Otter manual annotation tool logic, it will try to lock the clones corresponding to the genome region being updated. If the clones can't be locked, the annotation won't succeed. In this case, depending on the chosen pipeline options, the job can either finish "successfully" (i.e. fail silently) or fail with a proper error message.
+
+### 5. Stats
+
+When all the annotation jobs are done, the pipeline will extract some statistics of the updated annotation from the log files and the target database.
+
+### 6. Track hub
+
+The pipeline makes bigBed files for the input annotation and the updated annotation and creates a track hub directory containing those files. This track hub directory can then be manually uploaded to an ftp site.
+
+
+
 ## Software
+
 The pipeline code is mostly written in Perl. It relies heavily on the Ensembl and Otter Perl APIs.
-The target database is similar to an Ensembl core database, with some extensions to track annotation authorship and avoid concurrent annotation of the same region. 
+The target database schema is similar to an Ensembl core schema with additional tables to track annotation authorship and avoid concurrent annotation of the same region. 
 Database access is granted via an Ensembl private repository (server-config).
-The pipeline manager is eHive (https://ensembl-hive.readthedocs.io).
+The workflow manager is eHive (https://ensembl-hive.readthedocs.io).
 
 
 ### Dependencies
@@ -25,7 +93,6 @@ The pipeline manager is eHive (https://ensembl-hive.readthedocs.io).
 * server-config (https://github.com/Ensembl/server-config) [private]
 * ensembl-analysis (https://github.com/Ensembl/ensembl-analysis)
 * ensembl-hive (https://github.com/Ensembl/ensembl-hive)
-
 
 
 ### Installation
@@ -43,7 +110,8 @@ git clone https://github.com/Ensembl/ensembl-hive.git
 Install cpanm to have other Perl dependencies installed:
 ```sh
 curl -L http://cpanmin.us | perl - App::cpanminus
-#Add "$HOME/perl5/bin" to the $PATH environment variable
+#It will be installed at "$HOME/perl5/bin" by default, 
+#so add this to your $PATH environment variable
 export PATH="$HOME/perl5/bin:$PATH"
 ```
 
@@ -85,62 +153,17 @@ chmod 0750 $HOME/.otter/server-config
 ```
 
 ### Test
-[TO DO]
 
+[TBC]
 
-## Pipeline steps
-### 1. Input file pre-filter (splice-site-based filter of input annotation)
-
-The input annotation file can be pre-filtered at the start of the pipeline to remove transcripts with unreliable splice sites. This step consists of a set of filters that check for:
-
-- introns having a Recount3 score below certain threshold (eg. 50) unless already present in the reference annotation
-- introns with any obvious misalignments around the splice sites (requires access to BAM file with supporting reads)
-- splice site overlap with repeat features
-- overlap with processed pseudogenes
-- overlap with coding genes in the opposite strand
-
-The final output is a list of input transcripts that contain at least an intron that failed any of the filters. Transcripts in the list will be ignored in subsequent steps.
-
-This step is optional and can be skipped if:
-
-- the filter list from a previous pipeline run using the same input annotation file is provided
-- the filters are carried out during the annotation step
-- no intron filters are required
-
-### 2. Reset the target database
-
-For pipeline tests, the target database can be synchronised with another reference database before the annotation step. Basically, this step consists of replacing the target database with a source database, which will normally be a database with the current reference annotation. This step is optional but advisable when the pipeline has been previously run against the same target database. However, this step must never be done when the target database is one of the production databases.
-
-### 3. Split the input annotation file
-
-The input gtf/gff3 file is normally split in smaller input files to be processed independently. Each smaller input file contains one or more genomic clusters of transcripts (a cluster may contain transcripts on both strands but no transcriptless gap). The original input file doesn't have to be sorted by genomic location: the pipeline will sort and group the input transcripts in clusters.
-
-### 4. Annotation
-
-The annotation in each individual input file is parsed and converted into Bio::Vega objects. The pipeline then searches the reference annotation database for possible host genes for each input transcript and determines which gene is the most suitable one. If there is no host gene for a transcript, it will create a new gene for that transcript. At the same time, several filters are applied: input transcripts can be rejected based on the biotype or protected status of the chosen host gene, or on the number of genes with exonic overlap with the transcript.
-
-Input transcripts are subsequently compared with each existing transcript in the host gene and the pipeline determines if the input transcript provides any exon or intron novelty and whether both transcripts could be merged. Based on all these comparisons, the pipeline chooses whether to merge the input transcript with an existing transcript or to add the input transcript as a novel transcript.
-
-Then, the pipeline attempts to create a CDS if the host gene is coding, and chooses an adequate biotype for the transcript.
-
-(...)
-
-Eventually, the pipeline will try to store the new annotation (one gene at a time) in the target database. As this process uses the Otter manual annotation tool logic, it will try to lock the clones corresponding to the genome region being updated. If the clones can't be locked, the annotation won't succeed. In this case, depending on the chosen pipeline options, the job can either finish "successfully" (i.e. fail silently) or fail with a proper error message.
-
-### 5. Stats
-
-When all the annotation jobs are done, the pipeline will extract some statistics of the updated annotation from the log files and the target database.
-
-### 6. Track hub
-
-The pipeline makes bigBed files for the input annotation and the updated annotation and creates a track hub directory containing those files. This track hub directory can then be uploaded to our ftp site (manually).
 
 
 ## Running the pipeline
 
-Run the pipeline in a tmux or screen session.
+The pipeline should be run in a tmux or screen session.
 
 ### Software environment
+
 The PERL5LIB and PATH variables must include the paths to the software dependencies as described above.
 
 ### Initialisation
@@ -152,8 +175,8 @@ init_pipeline.pl LoutreWrite::Hive::LoutreWrite_conf \
   --hive_force_init 1
 ```
 
-
 ### Pipeline options
+
 | Name | Description | Default |
 | ------ | ------ | ------ |
 | pipe_db_host | eHive pipeline database host	| |
@@ -197,8 +220,7 @@ init_pipeline.pl LoutreWrite::Hive::LoutreWrite_conf \
 
 NOTE: all these parameters require a value (default: '1') or eHive will parse them incorrectly.
 
-The init_pipeline.pl command will create the pipeline database. Note that the final pipeline database name will be the value of the -pipeline_name option, prefixed with the user name and suffixed with 'pipe' (see example below).
-
+The `init_pipeline.pl` command will create the pipeline database. Note that the final pipeline database name will be the value of the -pipeline_name option, prefixed with the user name and suffixed with 'pipe' (see example below).
 
 
 ### Start the pipeline
@@ -211,13 +233,9 @@ beekeeper.pl \
   -loop
 ```
 
-
 ### GuiHive
 
-Check the pipeline status in a web browser using a URL with the following pattern:
-```sh
-http://guihive.ebi.ac.uk:8080/versions/97/?driver=mysql&username=${DBUSER}&host=${DBHOST}&port=${DBPORT}&dbname=${DBNAME}&passwd=xxxxx
-```
+Check the pipeline status in a web browser using the URL provided by the `init_pipeline.pl` command.
 
 
 
